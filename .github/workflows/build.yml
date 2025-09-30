@@ -1,14 +1,15 @@
-name: Build LVGL-MicroPython bin
+name: Build LVGL-MicroPython firmware
 
 on:
-  workflow_dispatch:   # 手动触发
+  workflow_dispatch:   # 手动按钮
   push:
-    branches: [ main ]
+    branches: [ main, master ]   # 兼容两种默认分支名
 
 jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - board: ESP32_GENERIC_S3
@@ -19,30 +20,55 @@ jobs:
             extra: octal-flash
 
     steps:
-    - uses: actions/checkout@v4
+    # 1. 拉代码 + 子模块
+    - name: Checkout repo
+      uses: actions/checkout@v4
       with:
         submodules: recursive
 
+    # 2. 设 Python
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
-    - name: Install host deps
+    # 3. 装系统包
+    - name: Install host dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y cmake ninja-build
 
-    - name: Install ESP-IDF & toolchains
+    # 4. 缓存 ESP-IDF + 工具链（二次提速）
+    - name: Cache ESP-IDF
+      uses: actions/cache@v4
+      id: cache-idf
+      with:
+        path: ~/esp-idf
+        key: ${{ runner.os }}-idf-v5.3-202406
+
+    # 5. 克隆 & 安装工具链（命中缓存会跳过）
+    - name: Clone ESP-IDF
+      if: steps.cache-idf.outputs.cache-hit != 'true'
       run: |
         git clone -b v5.3 --recursive https://github.com/espressif/esp-idf.git ~/esp-idf
+    - name: Install ESP-IDF tools
+      run: |
         ~/esp-idf/install.sh esp32s3
-        echo "IDF_PATH=~/esp-idf" >> $GITHUB_ENV
+        echo "IDF_PATH=$HOME/esp-idf" >> $GITHUB_ENV
 
-    - name: Build
+    # 6. 导入 IDF 环境 & 装 Python 依赖
+    - name: Install Python deps
+      working-directory: ${{ github.workspace }}
       run: |
         . ~/esp-idf/export.sh
+        python -m pip install --upgrade pip
         python -m pip install -r requirements.txt
+
+    # 7. 编译固件
+    - name: Build firmware
+      working-directory: ${{ github.workspace }}
+      run: |
+        . ~/esp-idf/export.sh
         python make.py esp32 \
           BOARD=${{ matrix.board }} \
           BOARD_VARIANT=${{ matrix.variant }} \
@@ -51,8 +77,9 @@ jobs:
           flash-size=${{ matrix.flash-size }} \
           ${{ matrix.extra }}
 
-    - name: Upload bin artifact
+    # 8. 上传成品 .bin
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: lvgl_micropy_${{ matrix.board }}-${{ matrix.flash-size }}.bin
-        path: build/lvgl_micropy*.bin
+        path: ${{ github.workspace }}/build/lvgl_micropy*.bin
