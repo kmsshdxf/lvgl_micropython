@@ -1,85 +1,93 @@
-name: Build LVGL-MicroPython firmware
+# Copyright (c) 2024 - 2025  Kevin G. Schlosser
+# 衍生：ESP32-S3 16MB 八角闪存 + ST7796 + FT6X36 专用单文件 workflow
+name: ESP32-S3 ST7796 FT6X36 16MB build
 
 on:
-  workflow_dispatch:   # 手动按钮
+  workflow_dispatch:          # 手动按钮
   push:
-    branches: [ main, master ]   # 兼容两种默认分支名
+    branches: [ main, master ]
+  pull_request:
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - board: ESP32_GENERIC_S3
-            variant: SPIRAM_OCT
-            display: st7796
-            indev: ft6x36
-            flash-size: 16MB
-            extra: octal-flash
-
+  build_esp32_s3_16mb:
+    if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
+    runs-on: self-hosted      # 与原 Unix 文件保持一致；无自托管可改为 ubuntu-latest
     steps:
-    # 1. 拉代码 + 子模块
-    - name: Checkout repo
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
+    - uses: actions/checkout@v4
 
-    # 2. 设 Python
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
-    # 3. 装系统包
-    - name: Install host dependencies
+    # ---- 拉最小子模块 ----
+    - name: Install Deps
       run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake ninja-build
+        git submodule update --init --depth 1 -- lib/pycparser
+        git submodule update --init --depth 1 --jobs 4 -- lib/micropython
+        git submodule update --init --depth 1 --jobs 4 -- lib/lvgl
 
-    # 4. 缓存 ESP-IDF + 工具链（二次提速）
-    - name: Cache ESP-IDF
+    # ---- 缓存 ESP-IDF 与工具链 ----
+    - name: Cached Deps
+      id: cache-deps
       uses: actions/cache@v4
-      id: cache-idf
       with:
-        path: ~/esp-idf
-        key: ${{ runner.os }}-idf-v5.3-202406
+        path: |
+          lib/esp-idf
+          ~/.espressif
+        key: ${{ runner.os }}-v4-deps
 
-    # 5. 克隆 & 安装工具链（命中缓存会跳过）
-    - name: Clone ESP-IDF
-      if: steps.cache-idf.outputs.cache-hit != 'true'
+    # ---- 首次命中失败时拉全 IDF ----
+    - name: Get Build Deps
+      if: steps.cache-deps.outputs.cache-hit != 'true'
       run: |
-        git clone -b v5.3 --recursive https://github.com/espressif/esp-idf.git ~/esp-idf
-    - name: Install ESP-IDF tools
-      run: |
-        ~/esp-idf/install.sh esp32s3
-        echo "IDF_PATH=$HOME/esp-idf" >> $GITHUB_ENV
+        git submodule update --init --depth 1 --jobs 4 -- lib/esp-idf
+        cd lib/esp-idf
+        git submodule update --init --depth 1 --jobs 4 \
+          components/bt/host/nimble/nimble \
+          components/esp_wifi \
+          components/esptool_py/esptool \
+          components/lwip/lwip \
+          components/mbedtls/mbedtls \
+          components/bt/controller/lib_esp32 \
+          components/bt/controller/lib_esp32c3_family
+        cd ../..
+        export "IDF_PATH=${GITHUB_WORKSPACE}/lib/esp-idf"
+        ./lib/esp-idf/install.sh esp32s3   # 只装 S3 工具链，比 all 快一半
 
-    # 6. 导入 IDF 环境 & 装 Python 依赖
-    - name: Install Python deps
-      working-directory: ${{ github.workspace }}
+    # ---- 每步导入 IDF 环境 ----
+    - name: Setup ESP-IDF
       run: |
-        . ~/esp-idf/export.sh
+        export "IDF_PATH=${GITHUB_WORKSPACE}/lib/esp-idf"
+        . ./lib/esp-idf/export.sh
+
+    # ---- 装 Python 依赖（路径照原仓库）----
+    - name: Install Python requirements
+      run: |
+        export "IDF_PATH=${GITHUB_WORKSPACE}/lib/esp-idf"
+        . ./lib/esp-idf/export.sh
         python -m pip install --upgrade pip
-        python -m pip install -r requirements.txt
+        for req in tools/requirements/*.txt; do
+          python -m pip install -r "$req"
+        done
 
-    # 7. 编译固件
-    - name: Build firmware
-      working-directory: ${{ github.workspace }}
+    # ====== 只编我们要的：S3 + 八角 SPIRAM + 16MB + ST7796 + FT6X36 ======
+    - name: Build ESP32-S3 16MB OCTAL ST7796 FT6X36
       run: |
-        . ~/esp-idf/export.sh
-        python make.py esp32 \
-          BOARD=${{ matrix.board }} \
-          BOARD_VARIANT=${{ matrix.variant }} \
-          DISPLAY=${{ matrix.display }} \
-          INDEV=${{ matrix.indev }} \
-          flash-size=${{ matrix.flash-size }} \
-          ${{ matrix.extra }}
+        export "IDF_PATH=${GITHUB_WORKSPACE}/lib/esp-idf"
+        . ./lib/esp-idf/export.sh
+        python3 make.py esp32 \
+          BOARD=ESP32_GENERIC_S3 \
+          BOARD_VARIANT=SPIRAM_OCT \
+          --flash-size=16 \
+          --octal-flash \
+          DISPLAY=st7796 \
+          INDEV=ft6x36 \
+          --ccache \
+          --no-scrub
 
-    # 8. 上传成品 .bin
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
+    # ---- 收集产物 ----
+    - uses: actions/upload-artifact@v4
       with:
-        name: lvgl_micropy_${{ matrix.board }}-${{ matrix.flash-size }}.bin
-        path: ${{ github.workspace }}/build/lvgl_micropy*.bin
+        name: lvgl_micropy_ESP32_S3_ST7796_FT6X36_16MB
+        path: build/lvgl_micropy*.bin
+        if-no-files-found: error
